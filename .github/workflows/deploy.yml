@@ -1,0 +1,117 @@
+name: Build and Deploy to AWS ECR and Elastic Beanstalk
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      deploy_to_eb:
+        description: 'Deploy to Elastic Beanstalk'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: python-hello
+  EB_APPLICATION_NAME: python-hello
+  EB_ENVIRONMENT_NAME: python-hello-env
+
+jobs:
+  build-and-push-to-ecr:
+    runs-on: ubuntu-latest
+    
+    outputs:
+      image-uri: ${{ steps.build.outputs.image-uri }}
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+      
+    - name: Build, tag, and push image to Amazon ECR
+      id: build
+      run: |
+        # Get ECR registry
+        ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+        
+        # Create image tag
+        IMAGE_TAG=${GITHUB_SHA:0:7}
+        IMAGE_URI=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+        LATEST_URI=$ECR_REGISTRY/$ECR_REPOSITORY:latest
+        
+        # Build image
+        docker build -t $IMAGE_URI -t $LATEST_URI .
+        
+        # Push image
+        docker push $IMAGE_URI
+        docker push $LATEST_URI
+        
+        # Output image URI
+        echo "image-uri=$LATEST_URI" >> $GITHUB_OUTPUT
+        echo "Image pushed: $IMAGE_URI"
+        echo "Image pushed: $LATEST_URI"
+
+  deploy-to-elastic-beanstalk:
+    runs-on: ubuntu-latest
+    needs: build-and-push-to-ecr
+    if: github.event.inputs.deploy_to_eb == 'true' || (github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_to_eb != 'false')
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+        
+    - name: Create Dockerrun.aws.json
+      run: |
+        cat > Dockerrun.aws.json << EOF
+        {
+          "AWSEBDockerrunVersion": "1",
+          "Image": {
+            "Name": "${{ needs.build-and-push-to-ecr.outputs.image-uri }}",
+            "Update": "true"
+          },
+          "Ports": [
+            {
+              "ContainerPort": 8000,
+              "HostPort": 80
+            }
+          ]
+        }
+        EOF
+        
+        echo "Created Dockerrun.aws.json:"
+        cat Dockerrun.aws.json
+        
+    - name: Create deployment package
+      run: |
+        zip -r deploy-${{ github.sha }}.zip Dockerrun.aws.json
+        
+    - name: Deploy to Elastic Beanstalk
+      uses: einaregilsson/beanstalk-deploy@v22
+      with:
+        aws_access_key: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws_secret_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        application_name: ${{ env.EB_APPLICATION_NAME }}
+        environment_name: ${{ env.EB_ENVIRONMENT_NAME }}
+        region: ${{ env.AWS_REGION }}
+        version_label: deploy-${{ github.sha }}
+        deployment_package: deploy-${{ github.sha }}.zip
+        wait_for_deployment: true
